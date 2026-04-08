@@ -41,7 +41,7 @@ st.sidebar.markdown("---")
 st.sidebar.header("Cost Assumptions")
 freight_cost = st.sidebar.number_input("Freight to Storage ($/lb)", value=0.050, format="%.3f", step=0.010)
 
-storage_cost_per_week = 0.15 
+storage_cost_per_week = 0.015 
 st.sidebar.info(f"🔒 Storage Cost is hardcoded at **${storage_cost_per_week:.2f} /lb/week**")
 
 # --- NEW FEATURE: Buyer Target Price ---
