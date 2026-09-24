@@ -27,6 +27,7 @@ api_key = st.sidebar.text_input("USDA API Key:", type="password")
 cut_options = {
     "90% Trimmings (90)": "90",
     "81% Trimmings (81)": "81",
+    "65% Trimmings (65)": "65",
     "Striploin (180)": "180",
     "Ribeye Hvy (112A)": "112A",
     "Top Butt CC (184B)": "184B",
@@ -34,6 +35,10 @@ cut_options = {
     "Tri Tip Peeled (185D)": "185D",
     "Tenderloin (189A)": "189A"
 }
+
+# Codes pulled from the trimmings report (2462) rather than boxed beef cuts (2461)
+TRIM_CODES = ["65", "81", "90"]
+
 selected_cut_name = st.sidebar.selectbox("Primary Target Commodity:", list(cut_options.keys()))
 target_code = cut_options[selected_cut_name]
 forecast_weeks = st.sidebar.slider("Weeks to Forecast", 4, 26, 12)
@@ -53,6 +58,7 @@ target_promo_price = st.sidebar.number_input(
     help="Set to 0 to disable. If set, draws a target execution line on the forecast chart."
 )
 
+
 # ==========================================
 # DATA FETCHING
 # ==========================================
@@ -64,13 +70,18 @@ def get_beef_data(key, item_code):
 
     df_list = []
 
-    if item_code in ["81", "90"]:
+    if item_code in TRIM_CODES:
         url = f"https://mpr.datamart.ams.usda.gov/services/v1.1/reports/2462/National?q=report_date={date_range}"
         urls_to_check = [(url, 'price_range_avg')]
     else:
         base_url = "https://mpr.datamart.ams.usda.gov/services/v1.1/reports/2461/"
         sections = ["Choice%20Cuts", "Select%20Cuts", "Choice%2FSelect%20Overlaps"]
         urls_to_check = [(base_url + s + f"?q=report_date={date_range}", 'weighted_average') for s in sections]
+
+    # FIX: code must stand alone in the description. A plain substring match let
+    # "65" hit "165"/"650" and "180" hit "180A", blending unrelated items into the
+    # daily average.
+    pattern = rf"(?<!\d){item_code}(?![\dA-Za-z])"
 
     for fetch_url, col in urls_to_check:
         resp = requests.get(fetch_url, auth=HTTPBasicAuth(key, ''))
@@ -83,7 +94,7 @@ def get_beef_data(key, item_code):
 
                 if desc_col in temp_df.columns:
                     matched = temp_df[temp_df[desc_col].astype(str).str.contains(
-                        item_code, case=False, na=False, regex=True)].copy()
+                        pattern, case=False, na=False, regex=True)].copy()
                     if not matched.empty:
                         matched['target_price_col'] = matched[col]
                         df_list.append(matched)
@@ -110,10 +121,9 @@ def get_beef_data(key, item_code):
 
 # ==========================================
 # MODEL TRAINING
-# FIX: cache_resource (not cache_data) — a fitted Prophet model holds a
-# compiled Stan backend that does not survive pickling. Also takes an explicit
-# `fingerprint` so the cache actually invalidates when new USDA rows land
-# (the underscore on _df excludes it from the cache key).
+# cache_resource (not cache_data) — a fitted Prophet model holds a compiled Stan
+# backend that does not survive pickling. `fingerprint` invalidates the cache
+# when new USDA rows land (the underscore on _df excludes it from the cache key).
 # ==========================================
 @st.cache_resource(ttl=86400, show_spinner="Training AI...")
 def run_prophet(_df, price_col, weeks_out, item_code, fingerprint):
@@ -126,9 +136,8 @@ def run_prophet(_df, price_col, weeks_out, item_code, fingerprint):
 
 # ==========================================
 # BACKTEST
-# FIX: rolling-origin cross-validation scored against held-out data, plus a
-# naive carry-forward baseline. In-sample R² measured fit to data the model
-# already saw and was effectively always "reliable".
+# Rolling-origin cross-validation scored against held-out data, plus a naive
+# carry-forward baseline.
 # ==========================================
 @st.cache_data(ttl=86400, show_spinner="Backtesting against held-out history...")
 def backtest_model(_model, _df, price_col, weeks_out, item_code, fingerprint):
@@ -170,8 +179,7 @@ def backtest_model(_model, _df, price_col, weeks_out, item_code, fingerprint):
 
 # ==========================================
 # PLOTTING
-# FIX: replaces prophet.plot.plot_plotly, which runs `assert m.history` and
-# raises ValueError because pandas refuses to evaluate a DataFrame's truthiness.
+# Replaces prophet.plot.plot_plotly, which raises ValueError on `assert m.history`.
 # ==========================================
 def plot_forecast(df_hist, price_col, forecast, cut_name):
     fig = go.Figure()
@@ -381,6 +389,8 @@ if api_key:
                                                       y=df_spread['Spread'], marker_color='green')])
                     fig_diff.update_layout(yaxis_title="Spread ($/lb)", hovermode="x unified")
                     st.plotly_chart(fig_diff, use_container_width=True)
+                else:
+                    st.error(f"Failed to load data for {baseline_name}.")
 
     else:
         st.error(f"Failed to load data for {selected_cut_name}. The USDA may not have published this code recently.")
