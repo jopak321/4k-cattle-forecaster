@@ -34,17 +34,19 @@ cut_options = {
     "Chuck Roll Neck Off (116A)": "116A",
     "Tri Tip Peeled (185D)": "185D",
     "Tenderloin (189A)": "189A",
-    "Livers, Selected 2/box (By-Product)": "LIVERS",
-    "Lungs (By-Product)": "LUNGS",
+    "Livers, Regular 2/box (Cow By-Product)": "LIVERS",
+    "Lungs (Cow By-Product)": "LUNGS",
 }
 
 # Codes pulled from the trimmings report (2462) rather than boxed beef cuts (2461)
 TRIM_CODES = ["65", "81", "90"]
 
-# Items pulled from By-Product Drop Value (Steers) (Cattle) (NW_LS441 / 447),
-# My Market News slug 2829, served by the MARS API (not the LMR DataMart).
+# Items pulled from USDA By-Product Drop Value Report-Cow (NW_LS444), weekly,
+# My Market News slug 2834, served by the MARS API (not the LMR DataMart).
+# Price used is the Wtd Avg Price column ($/cwt), converted to $/lb.
 # Patterns anchor to the start of the item name so "Livers" can't hit another row.
-BYPRODUCT_SLUG = "2829"
+BYPRODUCT_SLUG = "2834"
+BYPRODUCT_SECTION = "cow"  # keep rows from the COW table if the response labels sections
 BYPRODUCT_ITEMS = {
     "LIVERS": r"^\s*livers?\b",
     "LUNGS": r"^\s*lungs?\b",
@@ -103,12 +105,12 @@ class ByproductFetchError(RuntimeError):
         self.log = log
 
 
-@st.cache_data(ttl=86400, show_spinner="Fetching USDA By-Product Drop Value report...")
-def fetch_byproduct_raw(key):
+@st.cache_data(ttl=86400, show_spinner="Fetching USDA By-Product Drop Value (Cow) report...")
+def fetch_byproduct_raw(key, slug=BYPRODUCT_SLUG):
     """Pull the whole By-Product Drop Value report (all items) once; Livers and Lungs
     are filtered from the same cached pull. Tries a few documented URL forms per
     chunk and keeps a log of every request for troubleshooting."""
-    base = f"https://marsapi.ams.usda.gov/services/v1.2/reports/{BYPRODUCT_SLUG}"
+    base = f"https://marsapi.ams.usda.gov/services/v1.2/reports/{slug}"
     end_date = datetime.now()
     start_date = end_date - timedelta(days=4 * 365)
 
@@ -177,7 +179,8 @@ def get_byproduct_data(key, item_code):
                          if raw[c].astype(str).str.contains('Livers', case=False).any()), None)
     price_col_raw = _first_col(raw, ['wtd_avg_price', 'weighted_avg_price', 'wtd_avg',
                                      'avg_price', 'weighted_average', 'price'])
-    date_col = _first_col(raw, ['report_date', 'report_begin_date', 'published_date'])
+    # Weekly report: date each row by its week-ending date when the API provides it
+    date_col = _first_col(raw, ['report_end_date', 'report_date', 'report_begin_date', 'published_date'])
 
     if not (item_col and price_col_raw and date_col):
         _show_byproduct_diagnostics("unexpected columns", raw=raw)
@@ -189,13 +192,12 @@ def get_byproduct_data(key, item_code):
         _show_byproduct_diagnostics(f"no rows matched {item_code}", raw=raw)
         return df, ""
 
-    # The report repeats each offal item under both STEER and CATTLE tables with the
-    # same price. Keep the steer rows when the section/class is labeled.
+    # If the response splits items into labeled tables, keep the one we want.
     for label_col in ['reportSection', 'class', 'section', 'category']:
         if label_col in df.columns:
-            steer = df[df[label_col].astype(str).str.contains('steer', case=False, na=False)]
-            if not steer.empty:
-                df = steer
+            keep = df[df[label_col].astype(str).str.contains(BYPRODUCT_SECTION, case=False, na=False)]
+            if not keep.empty:
+                df = keep
             break
 
     if df.empty:
@@ -363,9 +365,16 @@ def plot_forecast(df_hist, price_col, forecast, cut_name):
         x=df_hist['report_date'], y=df_hist[price_col],
         mode='markers', marker=dict(color='black', size=4), name='Actual'))
 
+    # Keep a minimum y-range (±5% of the average price) so Plotly can't zoom into
+    # floating-point noise on a flat series.
+    lo = min(df_hist[price_col].min(), forecast['yhat_lower'].min())
+    hi = max(df_hist[price_col].max(), forecast['yhat_upper'].max())
+    pad = max((hi - lo) * 0.05, abs(df_hist[price_col].mean()) * 0.05)
+
     fig.update_layout(
         title=f"{cut_name} Projection",
         xaxis_title="Date", yaxis_title="Price ($/lb)",
+        yaxis=dict(range=[lo - pad, hi + pad]),
         hovermode="x unified", height=600)
     return fig
 
@@ -377,6 +386,36 @@ if api_key:
     df_historical, target_price_col = get_beef_data(api_key, target_code)
 
     if not df_historical.empty:
+        # --- Stale-quote guard: a price that hasn't changed in a year has no
+        # movement to model. Show the history and stop instead of fitting Prophet.
+        prices = df_historical[target_price_col]
+        last_year = df_historical[df_historical['report_date'] >=
+                                  df_historical['report_date'].max() - pd.Timedelta(days=365)]
+        if last_year[target_price_col].round(4).nunique() <= 1:
+            flat_price = prices.iloc[-1]
+            changed = df_historical[prices.round(4) != round(flat_price, 4)]
+            # First report after the last time the price was different
+            since = (df_historical.loc[df_historical['report_date'] > changed['report_date'].max(),
+                                       'report_date'].min()
+                     if not changed.empty else df_historical['report_date'].min())
+            st.warning(
+                f"⚠️ **NO PRICE MOVEMENT** — USDA has reported **{selected_cut_name}** at "
+                f"**${flat_price:.4f}/lb (${flat_price * 100:.2f}/cwt)** on every report since "
+                f"**{since:%B %d, %Y}**. This looks like a carried nominal quote, not active "
+                f"trading, so there is nothing to forecast. Price this item off actual quotes."
+            )
+            st.metric("Current USDA Price", f"${flat_price:.4f}/lb")
+            fig_flat = go.Figure(go.Scatter(
+                x=df_historical['report_date'], y=prices, mode='lines',
+                line=dict(color='black'), name='Actual'))
+            pad = abs(flat_price) * 0.05
+            fig_flat.update_layout(title=f"{selected_cut_name} History",
+                                   xaxis_title="Date", yaxis_title="Price ($/lb)",
+                                   yaxis=dict(range=[flat_price - pad, flat_price + pad]),
+                                   height=400)
+            st.plotly_chart(fig_flat, use_container_width=True)
+            st.stop()
+
         fingerprint = f"{len(df_historical)}|{df_historical['report_date'].max()}"
         model, forecast = run_prophet(
             df_historical, target_price_col, forecast_weeks, target_code, fingerprint
