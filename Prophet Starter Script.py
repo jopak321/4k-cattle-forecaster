@@ -33,11 +33,22 @@ cut_options = {
     "Top Butt CC (184B)": "184B",
     "Chuck Roll Neck Off (116A)": "116A",
     "Tri Tip Peeled (185D)": "185D",
-    "Tenderloin (189A)": "189A"
+    "Tenderloin (189A)": "189A",
+    "Livers, Selected 2/box (By-Product)": "LIVERS",
+    "Lungs (By-Product)": "LUNGS",
 }
 
 # Codes pulled from the trimmings report (2462) rather than boxed beef cuts (2461)
 TRIM_CODES = ["65", "81", "90"]
+
+# Items pulled from By-Product Drop Value (Steers) (Cattle) (NW_LS441 / 447),
+# My Market News slug 2829, served by the MARS API (not the LMR DataMart).
+# Patterns anchor to the start of the item name so "Livers" can't hit another row.
+BYPRODUCT_SLUG = "2829"
+BYPRODUCT_ITEMS = {
+    "LIVERS": r"^\s*livers?\b",
+    "LUNGS": r"^\s*lungs?\b",
+}
 
 selected_cut_name = st.sidebar.selectbox("Primary Target Commodity:", list(cut_options.keys()))
 target_code = cut_options[selected_cut_name]
@@ -62,8 +73,103 @@ target_promo_price = st.sidebar.number_input(
 # ==========================================
 # DATA FETCHING
 # ==========================================
+def _first_col(df, candidates):
+    """Return the first column name from `candidates` present in df (case-insensitive)."""
+    lower = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in lower:
+            return lower[cand.lower()]
+    return None
+
+
+def _flatten_mars(payload):
+    """MARS returns either {'results': [...]} or, with allSections=true, a list of
+    section objects each holding its own 'results'. Normalize to one DataFrame."""
+    frames = []
+    blocks = payload if isinstance(payload, list) else [payload]
+    for block in blocks:
+        if isinstance(block, dict) and block.get('results'):
+            frame = pd.DataFrame(block['results'])
+            if 'reportSection' in block and 'reportSection' not in frame.columns:
+                frame['reportSection'] = block['reportSection']
+            frames.append(frame)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def get_byproduct_data(key, item_code):
+    """Pull one item (Livers / Lungs) from the By-Product Drop Value report.
+    Prices are published in $/cwt and converted to $/lb to match the boxed-beef series."""
+    base = f"https://marsapi.ams.usda.gov/services/v1.2/reports/{BYPRODUCT_SLUG}"
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=4 * 365)
+
+    # Pull a year at a time so a 4-year request doesn't time out
+    raw_frames = []
+    chunk_start = start_date
+    while chunk_start < end_date:
+        chunk_end = min(chunk_start + timedelta(days=365), end_date)
+        rng = f"{chunk_start.strftime('%m/%d/%Y')}:{chunk_end.strftime('%m/%d/%Y')}"
+        url = f"{base}?q=report_begin_date={urllib.parse.quote(rng)}&allSections=true"
+        try:
+            resp = requests.get(url, auth=HTTPBasicAuth(key, ''), timeout=60)
+            if resp.status_code == 200:
+                frame = _flatten_mars(resp.json())
+                if not frame.empty:
+                    raw_frames.append(frame)
+        except (requests.RequestException, ValueError):
+            pass
+        chunk_start = chunk_end + timedelta(days=1)
+
+    if not raw_frames:
+        return pd.DataFrame(), ""
+
+    raw = pd.concat(raw_frames, ignore_index=True)
+
+    item_col = _first_col(raw, ['item', 'item_desc', 'item_description', 'commodity', 'product'])
+    if item_col is None:  # fall back to whichever column holds the item names
+        item_col = next((c for c in raw.columns
+                         if raw[c].astype(str).str.contains('Livers', case=False).any()), None)
+    price_col_raw = _first_col(raw, ['wtd_avg_price', 'weighted_avg_price', 'wtd_avg',
+                                     'avg_price', 'weighted_average', 'price'])
+    date_col = _first_col(raw, ['report_date', 'report_begin_date', 'published_date'])
+
+    if not (item_col and price_col_raw and date_col):
+        st.warning(f"By-product report came back in an unexpected shape. "
+                   f"Columns returned: {', '.join(map(str, raw.columns))}")
+        return pd.DataFrame(), ""
+
+    df = raw[raw[item_col].astype(str).str.contains(
+        BYPRODUCT_ITEMS[item_code], case=False, na=False, regex=True)].copy()
+
+    # The report repeats each offal item under both STEER and CATTLE tables with the
+    # same price. Keep the steer rows when the section/class is labeled.
+    for label_col in ['reportSection', 'class', 'section', 'category']:
+        if label_col in df.columns:
+            steer = df[df[label_col].astype(str).str.contains('steer', case=False, na=False)]
+            if not steer.empty:
+                df = steer
+            break
+
+    if df.empty:
+        return df, ""
+
+    price_col = 'target_price_col'
+    df[price_col] = pd.to_numeric(
+        df[price_col_raw].astype(str).str.replace(',', '', regex=False), errors='coerce') / 100.0
+    df = df[df[price_col] > 0]
+    if df.empty:
+        return df, price_col
+
+    df['report_date'] = pd.to_datetime(df[date_col])
+    df = df.groupby('report_date')[price_col].mean().reset_index()
+    return df.sort_values('report_date'), price_col
+
+
 @st.cache_data(ttl=86400, show_spinner="Fetching fresh USDA data across all sections...")
 def get_beef_data(key, item_code):
+    if item_code in BYPRODUCT_ITEMS:
+        return get_byproduct_data(key, item_code)
+
     end_date = datetime.now()
     start_date = end_date - timedelta(days=4 * 365)
     date_range = urllib.parse.quote(f"{start_date.strftime('%m/%d/%Y')}:{end_date.strftime('%m/%d/%Y')}")
