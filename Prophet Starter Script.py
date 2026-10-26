@@ -96,34 +96,80 @@ def _flatten_mars(payload):
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def get_byproduct_data(key, item_code):
-    """Pull one item (Livers / Lungs) from the By-Product Drop Value report.
-    Prices are published in $/cwt and converted to $/lb to match the boxed-beef series."""
+class ByproductFetchError(RuntimeError):
+    """Raised (instead of returning empty) so Streamlit does NOT cache a failed pull."""
+    def __init__(self, log):
+        super().__init__("By-product fetch returned no rows")
+        self.log = log
+
+
+@st.cache_data(ttl=86400, show_spinner="Fetching USDA By-Product Drop Value report...")
+def fetch_byproduct_raw(key):
+    """Pull the whole By-Product Drop Value report (all items) once; Livers and Lungs
+    are filtered from the same cached pull. Tries a few documented URL forms per
+    chunk and keeps a log of every request for troubleshooting."""
     base = f"https://marsapi.ams.usda.gov/services/v1.2/reports/{BYPRODUCT_SLUG}"
     end_date = datetime.now()
     start_date = end_date - timedelta(days=4 * 365)
 
-    # Pull a year at a time so a 4-year request doesn't time out
-    raw_frames = []
+    raw_frames, log = [], []
     chunk_start = start_date
-    while chunk_start < end_date:
+    while chunk_start < end_date:  # a year at a time so big requests don't time out
         chunk_end = min(chunk_start + timedelta(days=365), end_date)
-        rng = f"{chunk_start.strftime('%m/%d/%Y')}:{chunk_end.strftime('%m/%d/%Y')}"
-        url = f"{base}?q=report_begin_date={urllib.parse.quote(rng)}&allSections=true"
-        try:
-            resp = requests.get(url, auth=HTTPBasicAuth(key, ''), timeout=60)
-            if resp.status_code == 200:
-                frame = _flatten_mars(resp.json())
-                if not frame.empty:
-                    raw_frames.append(frame)
-        except (requests.RequestException, ValueError):
-            pass
+        rng = urllib.parse.quote(f"{chunk_start.strftime('%m/%d/%Y')}:{chunk_end.strftime('%m/%d/%Y')}")
+        variants = [
+            f"{base}?q=report_begin_date={rng}&allSections=true",
+            f"{base}/Details?q=report_begin_date={rng}",
+            f"{base}?q=report_begin_date={rng}",
+        ]
+        for url in variants:
+            try:
+                resp = requests.get(url, auth=HTTPBasicAuth(key, ''), timeout=60)
+                entry = {'url': url, 'status': resp.status_code, 'rows': 0,
+                         'snippet': resp.text[:300]}
+                if resp.status_code == 200:
+                    frame = _flatten_mars(resp.json())
+                    entry['rows'] = len(frame)
+                    if not frame.empty:
+                        raw_frames.append(frame)
+                        log.append(entry)
+                        break  # this URL form worked for this chunk
+                log.append(entry)
+            except (requests.RequestException, ValueError) as e:
+                log.append({'url': url, 'status': 'error', 'rows': 0, 'snippet': str(e)[:300]})
         chunk_start = chunk_end + timedelta(days=1)
 
     if not raw_frames:
-        return pd.DataFrame(), ""
+        raise ByproductFetchError(log)
+    return pd.concat(raw_frames, ignore_index=True), log
 
-    raw = pd.concat(raw_frames, ignore_index=True)
+
+def _show_byproduct_diagnostics(title, log=None, raw=None):
+    with st.expander(f"🔧 By-product troubleshooting: {title}", expanded=True):
+        if log:
+            st.dataframe(pd.DataFrame(log), use_container_width=True)
+            if any(e['status'] in (401, 403) for e in log):
+                st.error("USDA rejected the API key (401/403). The By-Product report runs on the "
+                         "MARS API, which requires your My Market News key (My Profile → API Key). "
+                         "The boxed beef/trim DataMart doesn't check the key, so those cuts can "
+                         "work even when this one is rejected.")
+        if raw is not None:
+            st.write("**Columns returned:**", list(raw.columns))
+            for c in raw.columns:
+                if raw[c].astype(str).str.contains('liver|lung|tongue|hide', case=False).any():
+                    st.write(f"**Item names found in `{c}`:**",
+                             sorted(raw[c].astype(str).unique().tolist())[:60])
+                    break
+
+
+def get_byproduct_data(key, item_code):
+    """Pull one item (Livers / Lungs) from the By-Product Drop Value report.
+    Prices are published in $/cwt and converted to $/lb to match the boxed-beef series."""
+    try:
+        raw, _ = fetch_byproduct_raw(key)
+    except ByproductFetchError as e:
+        _show_byproduct_diagnostics("no data returned", log=e.log)
+        return pd.DataFrame(), ""
 
     item_col = _first_col(raw, ['item', 'item_desc', 'item_description', 'commodity', 'product'])
     if item_col is None:  # fall back to whichever column holds the item names
@@ -134,12 +180,14 @@ def get_byproduct_data(key, item_code):
     date_col = _first_col(raw, ['report_date', 'report_begin_date', 'published_date'])
 
     if not (item_col and price_col_raw and date_col):
-        st.warning(f"By-product report came back in an unexpected shape. "
-                   f"Columns returned: {', '.join(map(str, raw.columns))}")
+        _show_byproduct_diagnostics("unexpected columns", raw=raw)
         return pd.DataFrame(), ""
 
     df = raw[raw[item_col].astype(str).str.contains(
         BYPRODUCT_ITEMS[item_code], case=False, na=False, regex=True)].copy()
+    if df.empty:
+        _show_byproduct_diagnostics(f"no rows matched {item_code}", raw=raw)
+        return df, ""
 
     # The report repeats each offal item under both STEER and CATTLE tables with the
     # same price. Keep the steer rows when the section/class is labeled.
@@ -165,11 +213,16 @@ def get_byproduct_data(key, item_code):
     return df.sort_values('report_date'), price_col
 
 
-@st.cache_data(ttl=86400, show_spinner="Fetching fresh USDA data across all sections...")
 def get_beef_data(key, item_code):
+    """Route each code to its USDA source. By-products are routed outside the cache
+    so a failed pull isn't stored for 24 hours."""
     if item_code in BYPRODUCT_ITEMS:
         return get_byproduct_data(key, item_code)
+    return get_lmr_data(key, item_code)
 
+
+@st.cache_data(ttl=86400, show_spinner="Fetching fresh USDA data across all sections...")
+def get_lmr_data(key, item_code):
     end_date = datetime.now()
     start_date = end_date - timedelta(days=4 * 365)
     date_range = urllib.parse.quote(f"{start_date.strftime('%m/%d/%Y')}:{end_date.strftime('%m/%d/%Y')}")
